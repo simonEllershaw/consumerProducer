@@ -56,12 +56,12 @@ int sem_wait (int id, short unsigned int num, const struct timespec* waitTime)
   return semtimedop (id, op, 1, waitTime);
 }
 
-void sem_signal (int id, short unsigned int num)
+int sem_signal (int id, short unsigned int num)
 {
   struct sembuf op[] = {
     {num, 1, SEM_UNDO}
   };
-  semop (id, op, 1);
+  return semop (id, op, 1);
 }
 
 int sem_close (int id)

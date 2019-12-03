@@ -26,7 +26,7 @@ int main (int argc, char **argv)
   if(argc != REQ_NUM_CMD_LINE_ARGS){
     std::cerr << "Error- Incorrect number of cmd line args given ("
               << (REQ_NUM_CMD_LINE_ARGS - 1) << " are required)." << std::endl;
-    return(-1);
+    return -1;
   }
   const int queueSize = check_arg(argv[1]);
   const int numJobsPerProducer = check_arg(argv[2]);
@@ -35,29 +35,26 @@ int main (int argc, char **argv)
 
   // Set up and intialise data structures
   // The main shared data structure- queue
-  int jobs[queueSize];
+  int jobs[queueSize], errorCode = 0;
   struct JobsCircularQueue queue = {jobs, 0, 0};
   // Parameters and threadIDs used at creation of threads stored for later
   // cleanup
-  struct ThreadParameter* parameters[numProducers + numConsumers];
+  struct ThreadParameter* parameters[numProducers + numConsumers] = {nullptr};
   pthread_t threadIDs[numProducers + numConsumers];
 
   // Set up and intialise semphores
-  int semaphoreInitFailed = 0;
   const int semaphoreArrayID = sem_create (SEM_KEY, NUM_SEMAPHORES);
   // Mutex is binary semaphore so intial value of 1
-  semaphoreInitFailed = sem_init(semaphoreArrayID, MUTEX_SEMAPHORE_INDEX, 1);
+  errorCode = sem_init(semaphoreArrayID, MUTEX_SEMAPHORE_INDEX, 1);
   // Ensures buffer not full before prodcuer is allowed access
-  semaphoreInitFailed = sem_init(semaphoreArrayID, SPACE_SEMAPHORE_INDEX, queueSize);
+  errorCode = sem_init(semaphoreArrayID, SPACE_SEMAPHORE_INDEX, queueSize);
   // Ensures there an item in the buffer before consumer allowed access
-  semaphoreInitFailed = sem_init(semaphoreArrayID, ITEM_SEMAPHORE_INDEX, 0);
-  if(semaphoreInitFailed){
-    cerr << "Error- The sempahore intialisation failed."
-          << " Please ensure their are no dangling semaphores using key: "
-          << hex << SEM_KEY << "." << endl;
-    return(-1);
+  errorCode = sem_init(semaphoreArrayID, ITEM_SEMAPHORE_INDEX, 0);
+  if(errorCode){
+    fprintf(stderr, "Error- The sempahore intialisation failed. Please ensure"
+                  "their are no dangling semaphores using key: %x\n", SEM_KEY);
+    return -1;
   }
-
 
   // Create producers
   for(int producerNum = 0; producerNum < numProducers; producerNum++){
@@ -65,8 +62,13 @@ int main (int argc, char **argv)
     parameters[producerNum] = new ThreadParameter{
                                     &queue, &semaphoreArrayID, (producerNum+1),
                                     &queueSize, &numJobsPerProducer};
-    pthread_create (&threadIDs[producerNum], NULL, producer,
+    errorCode = pthread_create (&threadIDs[producerNum], NULL, producer,
                     (void *) parameters[producerNum]);
+    if(errorCode){
+      // Assume none critical and so continue execution without thread
+      fprintf(stderr, "Warning- Failed to create Producer(%d)\n", producerNum);
+      errorCode = 0;
+    }
   }
 
   // Create consumers
@@ -78,25 +80,41 @@ int main (int argc, char **argv)
                                     &queueSize, NULL};
     pthread_create (&threadIDs[consumerNum + numProducers], NULL, consumer,
                     (void *) parameters[consumerNum + numProducers]);
+    if(errorCode){
+      // Assume none critical and so continue execution without thread
+      fprintf(stderr, "Warning- Failed to create Consumer(%d)\n", consumerNum);
+      errorCode = 0;
+    }
   }
 
   // Wait for all threads to finish execution
   for(int threadNum = 0; threadNum < numConsumers + numProducers; threadNum++){
-    pthread_join(threadIDs[threadNum], NULL);
+    errorCode = pthread_join(threadIDs[threadNum], NULL);
+    if(errorCode){
+      // Assume none critical and so continue execution without thread
+      fprintf(stderr, "Warning- Thread %lu may not have finished execution\n",
+              threadIDs[threadNum]);
+      errorCode = 0;
+    }
   }
 
   // Clean up
   for(int threadNum = 0; threadNum < numConsumers + numProducers; threadNum++){
-    delete parameters[threadNum];
+    if(parameters[threadNum] != nullptr) delete parameters[threadNum];
   }
-  sem_close(semaphoreArrayID);
+  errorCode = sem_close(semaphoreArrayID);
+  if(errorCode){
+    fprintf(stderr, "Error- Failed to close the semaphore array. Please do this"
+                    "manually using ipcs and ipcrm");
+    return -1;
+  }
 
   return 0;
 }
 
 void *producer (void *parameter)
 {
-  int jobTime, jobID;
+  int jobTime, jobID, errorCode;
   //Unpack parameter
   struct ThreadParameter* param = (ThreadParameter *) parameter;
   const int& numJobs = *(param->numJobs);
@@ -112,35 +130,57 @@ void *producer (void *parameter)
     jobTime = rand() % MAX_JOB_TIME + 1;
 
     // Wait for space in buffer (20 secs) and no other threads accessing
-    // the queue (no time limit)
-    if(sem_wait(semaphoneID, SPACE_SEMAPHORE_INDEX, TIMEOUT)){
-      cerr << "Producer(" << producerNum << "): Timed out as queue is full"
-            << endl;
-      pthread_exit (0);
+    // the queue (no time limit). Checks for semaphore failures also occur
+    errorCode = sem_wait(semaphoneID, SPACE_SEMAPHORE_INDEX, TIMEOUT);
+    if(errno == EAGAIN){
+      fprintf(stderr, "Producer(%d): Timed out as queue is full\n", producerNum);
+      pthread_exit(0);
     }
-    sem_wait(semaphoneID, MUTEX_SEMAPHORE_INDEX, NULL);
+    else if(errorCode){
+      fprintf(stderr, "Producer(%d): SPACE semaphore failed exiting thread\n",
+              producerNum);
+      pthread_exit(0);
+    }
+    if(sem_wait(semaphoneID, MUTEX_SEMAPHORE_INDEX, NULL)){
+      fprintf(stderr, "Producer(%d): MUTEX semaphore failed exiting thread\n",
+              producerNum);
+      pthread_exit(0);
+    }
+
     // Add job to the tail of the queue, record the jobID and increment the tail
     // by 1
     jobID = (queue->tail + 1);
     queue->jobs[queue->tail] = jobTime;
     queue->tail = jobID % queueSize; // Modulo as circular queue
 
-    // Print status
-    cerr << "Producer(" << producerNum << "): Job id " << jobID
-              << " duration " << jobTime << endl;
-
     // Re-allow access to the queue and increment the number of items by 1
-    sem_signal(semaphoneID, MUTEX_SEMAPHORE_INDEX);
+    // Raise users attention if errors occur
+    errorCode = sem_signal(semaphoneID, MUTEX_SEMAPHORE_INDEX);
+    if(errorCode){
+      fprintf(stderr, "Producer(%d): Warning MUTEX semaphore may not have been"
+        "restored to correct value. Exciting thread manual kill and clean up"
+        "maybe required\n", producerNum);
+      pthread_exit(0);
+    }
     sem_signal(semaphoneID, ITEM_SEMAPHORE_INDEX);
-  }
+    if(errorCode){
+      fprintf(stderr, "Producer(%d): Warning ITEM semaphore may not have been"
+        "restored to correct value. Exciting thread manual kill and clean up"
+        "maybe required\n", producerNum);
+      pthread_exit(0);
+    }
 
-  cerr << "Producer(" << producerNum << "): No jobs left to generate" << endl;
+    // Print status use fprintf to avoid interleaving of prints
+    fprintf(stderr, "Producer(%d): Job id %d duration %d\n",
+            producerNum, jobID, jobTime);
+  }
+  fprintf(stderr, "Producer(%d): No jobs left to generate\n", producerNum);
   pthread_exit(0);
 }
 
 void *consumer (void *parameter)
 {
-  int jobTime, jobID;
+  int jobTime, jobID, errorCode;
   //Unpack parameter (mainly to increase readability)
   struct ThreadParameter* param = (ThreadParameter *) parameter;
   JobsCircularQueue* & queue = param->queue;
@@ -150,25 +190,50 @@ void *consumer (void *parameter)
 
   // Wait an item to be in the queue (20 secs) and no other threads accessing
   // the queue (no time limit)
-  while(!sem_wait(semaphoneID, ITEM_SEMAPHORE_INDEX, TIMEOUT)){
-    sem_wait(semaphoneID, MUTEX_SEMAPHORE_INDEX, NULL);
+  while(!(errorCode = sem_wait(semaphoneID, ITEM_SEMAPHORE_INDEX, TIMEOUT))){
+    if(sem_wait(semaphoneID, MUTEX_SEMAPHORE_INDEX, NULL)){
+      fprintf(stderr, "Consumer(%d): MUTEX semaphore failed exiting thread\n",
+              consumerNum);
+      pthread_exit(0);
+    }
+
     // Read the jobID and time at the head of the queue and increment the head
     // by 1
     jobID = (queue->head + 1);
     jobTime = queue->jobs[queue->head];
     queue->head = jobID % queueSize;
-    // Allow access to the queue and increment the amount of space by 1
-    sem_signal(semaphoneID, MUTEX_SEMAPHORE_INDEX);
-    sem_signal(semaphoneID, SPACE_SEMAPHORE_INDEX);
 
-    // Execute job
-    std::cerr << "Consumer(" << consumerNum << "): Job id " << jobID
-              << " executing sleep duration " << jobTime << endl;
+    // Reallow access to the queue and increment the amount of space by 1
+    errorCode = sem_signal(semaphoneID, MUTEX_SEMAPHORE_INDEX);
+    if(errorCode){
+      fprintf(stderr, "Producer(%d): Warning MUTEX semaphore may not have been"
+        "restored to correct value. Exciting thread manual kill and clean up"
+        "maybe required\n", consumerNum);
+      pthread_exit(0);
+    }
+    sem_signal(semaphoneID, SPACE_SEMAPHORE_INDEX);
+    if(errorCode){
+      fprintf(stderr, "Producer(%d): Warning ITEM semaphore may not have been"
+        "restored to correct value. Exciting thread manual kill and clean up"
+        "maybe required\n", consumerNum);
+      pthread_exit(0);
+    }
+
+    // Execute job outside sempahore locks
+    fprintf(stderr, "Consumer(%d): Job id %d executing sleep duration %d\n",
+            consumerNum, jobID, jobTime);
     sleep(jobTime);
-    std::cerr << "Consumer(" << consumerNum << "): Job id " << jobID
-              << " completed" << endl;
+    fprintf(stderr, "Consumer(%d): Job id %d completed\n", consumerNum, jobID);
   }
 
-  cerr << "Consumer(" << consumerNum << "): No jobs left" << endl;
+  // Ensure consumer exits due to timeout error
+  if(errno == EAGAIN){
+    fprintf(stderr, "Consumer(%d): No jobs left\n", consumerNum);
+  }
+  else{
+    fprintf(stderr, "Consumer(%d): ITEM semaphore failed. Exiting thread\n",
+            consumerNum);
+  }
+
   pthread_exit (0);
 }
